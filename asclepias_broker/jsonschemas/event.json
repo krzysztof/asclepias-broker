@@ -6,10 +6,6 @@
   "additionalProperties": false,
   "type": "object",
   "properties": {
-    "ID": {
-      "type": "string",
-      "description": "Globally unique identifier of the event (UUID version 4 as specified in RFC 4122)."
-    },
     "Description": {
       "type": "string",
       "description": "Free-text description of the event."
@@ -19,10 +15,6 @@
       "description": "Type of the event. Controlled vocabulary: 'RelationshipCreated' or 'RelationshipDeleted'",
       "enum": ["RelationshipCreated", "RelationshipDeleted"]
 
-    },
-    "Time": {
-      "type": "string",
-      "description": "Time when the payload information was created."
     },
     "Creator": {
       "type": "string",
@@ -43,9 +35,7 @@
     }
   },
   "required": [
-    "ID",
     "EventType",
-    "Time",
     "Creator",
     "Source",
     "Payload"
