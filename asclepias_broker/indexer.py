@@ -11,110 +11,171 @@ from copy import deepcopy
 from itertools import chain
 from typing import Iterable
 from uuid import UUID
+from invenio_db import db
+from sqlalchemy.orm import aliased
 
+from invenio_search import current_search_client
+
+from elasticsearch_dsl import Search, Q
 import sqlalchemy as sa
 
 from .mappings.dsl import DB_RELATION_TO_ES, ObjectDoc, ObjectRelationshipsDoc
-from .models import Group, GroupRelationship, GroupType, Identifier, Relation
+from .models import Group, GroupRelationship, GroupType, Identifier, Relation, GroupRelationshipM2M, GroupM2M
+
+def build_group_metadata(group: Group) -> dict:
+    """Build the metadata for a group object."""
+    if group.type == GroupType.Version:
+        # Identifiers of the first identity group from all versions
+        id_group = group.groups[0]
+        ids = id_group.identifiers
+        doc = deepcopy((id_group.data and id_group.data.json) or {})
+    else:
+        doc = deepcopy((group.data and group.data.json) or {})
+        ids = group.identifiers
+
+    doc['Identifier'] = [{'ID': i.value, 'IDScheme': i.scheme} for i in ids]
+    # TODO: generate IDURL using idutils
+    doc['ID'] = str(group.id)
+    return doc
 
 
-# TODO: Move this to Group.identifiers
-def _get_group_identifiers(id_group: Group) -> Iterable[Identifier]:
-    assert id_group.type == GroupType.Identity
-    return (id2g.identifier for id2g in id_group.id2groups)
+def build_relationship_metadata(rel: GroupRelationship) -> dict:
+    """Build the metadata for a relationship."""
+    if rel.type == GroupType.Version:
+        # History of the first group relationship from all versions
+        # TODO: Maybe concatenate all histories?
+        id_rel = rel.relationships[0]
+        return deepcopy((id_rel.data and id_rel.data.json) or {})
+    else:
+        return deepcopy((rel.data and rel.data.json) or {})
 
 
-def _get_group_relationships(group_id: UUID) -> Iterable[GroupRelationship]:
-    # NOTE: These GroupRelationships are mixed in terms of the source/taget
-    # perspective.
-    return GroupRelationship.query.filter(
+def index_documents(docs):
+    """Index a list of documents into ES."""
+    for doc in docs:
+        current_search_client.index(
+            index='relationships', doc_type='doc', body=doc)
+
+
+def index_identity_group_relationships(ig_id: str, vg_id: str):
+    """Build the relationship docs for Identity relations."""
+    # Build the documents for incoming Version2Identity relations
+
+    import ipdb; ipdb.set_trace()
+    ver_grp_cls = aliased(Group, name='ver_grp_cls')
+    id_grp_cls = aliased(Group, name='id_grp_cls')
+    relationships = (
+        db.session.query(GroupRelationship, ver_grp_cls)
+        .join(id_grp_cls, GroupRelationship.source_id == id_grp_cls.id)
+        .join(GroupM2M, sa.and_(
+            GroupM2M.group_id == ver_grp_cls.id,
+            GroupM2M.subgroup_id == id_grp_cls.id
+            ))
+        .filter(
+            ver_grp_cls.type == GroupType.Version,
+            GroupRelationship.type == GroupType.Identity,
+            GroupRelationship.target_id == ig_id,
+        )
+    )
+    docs = []
+    for rel, src_vg in relationships:
+        src_meta = build_group_metadata(src_vg)
+        trg_meta = build_group_metadata(rel.target)  # TODO: rel.target -> ig_id
+        rel_meta = build_relationship_metadata(rel)
+        doc = {
+            # "ID":  TODO: push Rel ID or RelM2M ID
+            "Grouping": "identity",
+            "RelationshipType": rel.relation.name,
+            "History": rel_meta,
+            "Source": src_meta,
+            "Target": trg_meta,
+        }
+        docs.append(doc)
+
+    # Build the documents for outgoing Version2Identity relations
+    ver_grprel_cls = aliased(GroupRelationship, name='ver_grprel_cls')
+    id_grprel_cls = aliased(GroupRelationship, name='id_grprel_cls')
+    relationships = (
+        db.session.query(id_grprel_cls, Group)
+        .join(ver_grprel_cls, ver_grprel_cls.source_id == vg_id)
+        .join(GroupRelationshipM2M, sa.and_(
+            GroupRelationshipM2M.relationship_id == ver_grprel_cls.id,
+            GroupRelationshipM2M.subrelationship_id == id_grprel_cls.id))
+        .join(Group, id_grprel_cls.target_id == Group.id)
+        .filter(
+            Group.type == GroupType.Identity,
+            ver_grprel_cls.type == GroupType.Version,
+            id_grprel_cls.type == GroupType.Identity,
+        )
+    )
+
+    # vg_id_obj = TODO Resolve object
+    vg_id_obj = Group.query.get(vg_id)
+    for rel, trg_ig in relationships:
+        src_meta = build_group_metadata(vg_id_obj)
+        trg_meta = build_group_metadata(rel.target)
+        rel_meta = build_relationship_metadata(rel)
+        doc = {
+            # "ID":  TODO: push Rel ID or RelM2M ID
+            "Grouping": "identity",
+            "RelationshipType": rel.relation.name,
+            "History": rel_meta,
+            "Source": src_meta,
+            "Target": trg_meta,
+        }
+        docs.append(doc)
+    index_documents(docs)
+
+
+def index_version_group_relationships(group_id: str):
+    """Build the relationship docs for Version relations."""
+    relationships = GroupRelationship.query.filter(
+        GroupRelationship.type == GroupType.Version,
         sa.or_(
             GroupRelationship.source_id == group_id,
             GroupRelationship.target_id == group_id),
-        GroupRelationship.relation != Relation.IsIdenticalTo,
-        GroupRelationship.type == GroupType.Identity,
     )
+    docs = []
+    for rel in relationships:
+        src_meta = build_group_metadata(rel.source)
+        trg_meta = build_group_metadata(rel.target)
+        rel_meta = build_relationship_metadata(rel)
+        doc = {
+            # "ID":  TODO: push Rel ID or RelM2M ID
+            "Grouping": "version",
+            "RelationshipType": rel.relation.name,
+            "History": rel_meta,
+            "Source": src_meta,
+            "Target": trg_meta,
+        }
+        docs.append(doc)
+    index_documents(docs)
 
 
-def _build_object_relationships(group_id: UUID,
-                                rels: Iterable[GroupRelationship]):
-    # TODO: There's some issue here, depending on the perspective from which
-    # the group id checks relationships (the reverse relationship...)
-    relationships = defaultdict(list)
-    for r in rels:
-        es_rel, es_inv_rel = DB_RELATION_TO_ES[r.relation]
-        is_reverse = str(group_id) == str(r.target_id)
-        rel_key = es_inv_rel if is_reverse else es_rel
-        target_id = r.source_id if is_reverse else r.target_id
-        relationships[rel_key].append({
-            'TargetID': str(target_id),
-            'History': deepcopy((r.data and r.data.json) or {}),
-        })
-    return relationships
+def delete_group_relations(group_id):
+    """Delete all relations for given group ID from ES."""
+    q = Search(index='relationships').query('term', Source__ID=group_id)
+    q.delete()
+
+    q = Search(index='relationships').query('term', Target__ID=group_id)
+    q.delete()
 
 
-def delete_identity_group(id_group, with_relationships=True):
-    """Delete an identity group and its relationships document indices."""
-    obj_doc = ObjectDoc.get(str(id_group.id), ignore=404)
-    if obj_doc:
-        obj_doc.delete(ignore=404)
-
-    obj_rel_doc = ObjectRelationshipsDoc.get(str(id_group.id), ignore=404)
-    if obj_rel_doc:
-        obj_rel_doc.delete(ignore=404)
-    return obj_doc, obj_rel_doc
-
-
-def index_identity_group(id_group: Group) -> ObjectDoc:
-    """Index an identity group."""
-    # Build source object identifiers
-    doc = deepcopy((id_group.data and id_group.data.json) or {})
-
-    ids = _get_group_identifiers(id_group)
-    doc['Identifier'] = [{'ID': i.value, 'IDScheme': i.scheme} for i in ids]
-
-    obj_doc = ObjectDoc(meta={'id': str(id_group.id)}, **doc)
-    obj_doc.save()
-    return obj_doc
-
-
-def index_group_relationships(group_id: UUID) -> ObjectRelationshipsDoc:
-    """Index the relationships of an identity group."""
-    rels = _get_group_relationships(group_id)
-    doc = _build_object_relationships(group_id, rels)
-    rel_doc = ObjectRelationshipsDoc(meta={'id': str(group_id)}, **doc)
-    rel_doc.save()
-    return rel_doc
-
-
-def update_indices(src_group: Group, trg_group: Group,
-                   merged_group: Group=None):
+def update_indices(src_ig, trg_ig, mrg_ig, src_vg, trg_vg, mrg_vg):
     """Updates Elasticsearch indices with the updated groups."""
     # `src_group` and `trg_group` were merged into `merged_group`.
-    if merged_group:
-        # Delete Source and Traget groups
-        delete_identity_group(src_group)
-        delete_identity_group(trg_group)
+    for grp_id in [src_ig, trg_ig, src_vg, trg_vg]:
+        delete_group_relations(grp_id)
 
-        # Index the merged object and its relationships
-        obj_doc = index_identity_group(merged_group)
-        obj_rel_doc = index_group_relationships(merged_group.id)
+    if mrg_vg:
+        index_version_group_relationships(mrg_vg)
+    else:
+        index_version_group_relationships(src_vg)
+        index_version_group_relationships(trg_vg)
 
-        # Update all group relationships of the merged group
-        # TODO: This can be optimized to avoid fetching a lot of the same
-        # GroupMetadata, by keeping a temporary cache of them...
-        relationships = chain.from_iterable(obj_rel_doc.to_dict().values())
-        target_ids = [r.get('TargetID') for r in relationships]
-        for i in target_ids:
-            index_group_relationships(i)
-
-        return (obj_doc, obj_rel_doc), (obj_doc, obj_rel_doc)
-
-    # No groups were merged, this is a simple relationship
-
-    # Index Source and Target objects and their relationships
-    src_doc = index_identity_group(src_group)
-    trg_doc = index_identity_group(trg_group)
-    src_rel_doc = index_group_relationships(src_group.id)
-    trg_rel_doc = index_group_relationships(trg_group.id)
-    return (src_doc, src_rel_doc), (trg_doc, trg_rel_doc)
+    if mrg_ig:
+        index_identity_group_relationships(mrg_ig, mrg_vg)
+    else:
+        import ipdb; ipdb.set_trace()
+        index_identity_group_relationships(src_ig, src_vg)
+        index_identity_group_relationships(trg_ig, trg_vg)
