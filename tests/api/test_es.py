@@ -114,7 +114,7 @@ def _assert_equal_doc_and_model(doc, rel_doc, model):
 
 def test_simple_groups(db, es_clear):
     _handle_events([
-        (['C', 'A', 'Cites', 'B', '2018-01-01'], _scholix_data('A', 'B')),
+        (['C', '10.100/zenodo.123', 'Cites', 'B', '2018-01-01'], _scholix_data('A', 'B')),
         #(['C', 'A1', 'Cites', 'B', '2018-01-01'], _scholix_data('A1', 'B')),
         #(['C', 'C', 'Cites', 'B', '2018-01-01'], _scholix_data('C', 'B')),
         # (['C', 'B', 'IsIdenticalTo', 'B1', '2018-01-01'],

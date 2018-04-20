@@ -13,6 +13,7 @@ from typing import Iterable
 from uuid import UUID
 from invenio_db import db
 from sqlalchemy.orm import aliased
+import idutils
 
 from invenio_search import current_search_client
 
@@ -21,6 +22,20 @@ import sqlalchemy as sa
 
 from .mappings.dsl import DB_RELATION_TO_ES, ObjectDoc, ObjectRelationshipsDoc
 from .models import Group, GroupRelationship, GroupType, Identifier, Relation, GroupRelationshipM2M, GroupM2M
+
+def build_id_info(id_):
+    """Build information for the Identifier."""
+    data = {
+        'ID': id_.value,
+        'IDScheme': id_.scheme
+    }
+    try:
+        id_url = idutils.to_url(id_.value, id_.scheme)
+        if id_url:
+            data['IDURL'] = id_url
+    except Exception:
+        pass
+    return data
 
 def build_group_metadata(group: Group) -> dict:
     """Build the metadata for a group object."""
@@ -33,8 +48,7 @@ def build_group_metadata(group: Group) -> dict:
         doc = deepcopy((group.data and group.data.json) or {})
         ids = group.identifiers
 
-    doc['Identifier'] = [{'ID': i.value, 'IDScheme': i.scheme} for i in ids]
-    # TODO: generate IDURL using idutils
+    doc['Identifier'] = [build_id_info(i) for i in ids]
     doc['ID'] = str(group.id)
     return doc
 
@@ -57,33 +71,38 @@ def index_documents(docs):
             index='relationships', doc_type='doc', body=doc)
 
 
-def index_identity_group_relationships(ig_id: str, vg_id: str):
+def index_identity_group_relationships(ig_id: str, vg_id: str,
+        exclude_group_ids: tuple=None):
     """Build the relationship docs for Identity relations."""
     # Build the documents for incoming Version2Identity relations
 
-    import ipdb; ipdb.set_trace()
     ver_grp_cls = aliased(Group, name='ver_grp_cls')
     id_grp_cls = aliased(Group, name='id_grp_cls')
+    exclude_ig_id, exclude_vg_id = (exclude_group_ids or (None, None))
+
+    filter_cond = [
+        ver_grp_cls.type == GroupType.Version,
+        GroupRelationship.type == GroupType.Identity,
+        GroupRelationship.target_id == ig_id,
+    ]
+    if exclude_ig_id:
+        filter_cond.append(GroupRelationship.source_id != exclude_ig_id)
+
     relationships = (
-        db.session.query(GroupRelationship, ver_grp_cls)
-        .join(id_grp_cls, GroupRelationship.source_id == id_grp_cls.id)
-        .join(GroupM2M, sa.and_(
-            GroupM2M.group_id == ver_grp_cls.id,
-            GroupM2M.subgroup_id == id_grp_cls.id
-            ))
-        .filter(
-            ver_grp_cls.type == GroupType.Version,
-            GroupRelationship.type == GroupType.Identity,
-            GroupRelationship.target_id == ig_id,
-        )
+        db.session.query(GroupM2M, GroupRelationship, ver_grp_cls)
+        .join(id_grp_cls, GroupM2M.subgroup_id == id_grp_cls.id)
+        .join(ver_grp_cls, GroupM2M.group_id == ver_grp_cls.id)
+        .join(GroupRelationship, GroupRelationship.source_id == id_grp_cls.id)
+        .filter(*filter_cond)
     )
     docs = []
-    for rel, src_vg in relationships:
+    ig_obj = Group.query.get(ig_id)
+    for _, rel, src_vg in relationships:
         src_meta = build_group_metadata(src_vg)
-        trg_meta = build_group_metadata(rel.target)  # TODO: rel.target -> ig_id
+        trg_meta = build_group_metadata(ig_obj)
         rel_meta = build_relationship_metadata(rel)
         doc = {
-            # "ID":  TODO: push Rel ID or RelM2M ID
+            "ID": str(rel.id),
             "Grouping": "identity",
             "RelationshipType": rel.relation.name,
             "History": rel_meta,
@@ -95,6 +114,13 @@ def index_identity_group_relationships(ig_id: str, vg_id: str):
     # Build the documents for outgoing Version2Identity relations
     ver_grprel_cls = aliased(GroupRelationship, name='ver_grprel_cls')
     id_grprel_cls = aliased(GroupRelationship, name='id_grprel_cls')
+    filter_cond = [
+        Group.type == GroupType.Identity,
+        ver_grprel_cls.type == GroupType.Version,
+        id_grprel_cls.type == GroupType.Identity,
+    ]
+    if exclude_vg_id:
+        filter_cond.append(ver_grprel_cls.target_id != exclude_vg_id)
     relationships = (
         db.session.query(id_grprel_cls, Group)
         .join(ver_grprel_cls, ver_grprel_cls.source_id == vg_id)
@@ -102,21 +128,16 @@ def index_identity_group_relationships(ig_id: str, vg_id: str):
             GroupRelationshipM2M.relationship_id == ver_grprel_cls.id,
             GroupRelationshipM2M.subrelationship_id == id_grprel_cls.id))
         .join(Group, id_grprel_cls.target_id == Group.id)
-        .filter(
-            Group.type == GroupType.Identity,
-            ver_grprel_cls.type == GroupType.Version,
-            id_grprel_cls.type == GroupType.Identity,
-        )
+        .filter(*filter_cond)
     )
 
-    # vg_id_obj = TODO Resolve object
-    vg_id_obj = Group.query.get(vg_id)
+    vg_obj = Group.query.get(vg_id)
     for rel, trg_ig in relationships:
-        src_meta = build_group_metadata(vg_id_obj)
+        src_meta = build_group_metadata(vg_obj)
         trg_meta = build_group_metadata(rel.target)
         rel_meta = build_relationship_metadata(rel)
         doc = {
-            # "ID":  TODO: push Rel ID or RelM2M ID
+            "ID": str(rel.id),
             "Grouping": "identity",
             "RelationshipType": rel.relation.name,
             "History": rel_meta,
@@ -127,13 +148,22 @@ def index_identity_group_relationships(ig_id: str, vg_id: str):
     index_documents(docs)
 
 
-def index_version_group_relationships(group_id: str):
+def index_version_group_relationships(group_id: str, exclude_group_id: str=None):
     """Build the relationship docs for Version relations."""
+    if exclude_group_id:
+        filter_cond = sa.or_(
+            sa.and_(GroupRelationship.source_id == group_id,
+                    GroupRelationship.target_id != exclude_group_id),
+            sa.and_(GroupRelationship.target_id == group_id,
+                    GroupRelationship.source_id != exclude_group_id))
+    else:
+        filter_cond = sa.or_(
+            GroupRelationship.source_id == group_id,
+            GroupRelationship.target_id == group_id)
+
     relationships = GroupRelationship.query.filter(
         GroupRelationship.type == GroupType.Version,
-        sa.or_(
-            GroupRelationship.source_id == group_id,
-            GroupRelationship.target_id == group_id),
+        filter_cond
     )
     docs = []
     for rel in relationships:
@@ -141,7 +171,7 @@ def index_version_group_relationships(group_id: str):
         trg_meta = build_group_metadata(rel.target)
         rel_meta = build_relationship_metadata(rel)
         doc = {
-            # "ID":  TODO: push Rel ID or RelM2M ID
+            "ID": str(rel.id),
             "Grouping": "version",
             "RelationshipType": rel.relation.name,
             "History": rel_meta,
@@ -171,11 +201,12 @@ def update_indices(src_ig, trg_ig, mrg_ig, src_vg, trg_vg, mrg_vg):
         index_version_group_relationships(mrg_vg)
     else:
         index_version_group_relationships(src_vg)
-        index_version_group_relationships(trg_vg)
+        index_version_group_relationships(trg_vg, exclude_group_id=src_vg)
 
     if mrg_ig:
         index_identity_group_relationships(mrg_ig, mrg_vg)
     else:
-        import ipdb; ipdb.set_trace()
         index_identity_group_relationships(src_ig, src_vg)
-        index_identity_group_relationships(trg_ig, trg_vg)
+        index_identity_group_relationships(trg_ig, trg_vg,
+                                           exclude_group_ids=(src_ig, src_vg))
+    import ipdb; ipdb.set_trace()
